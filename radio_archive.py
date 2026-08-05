@@ -93,7 +93,8 @@ ILLEGAL_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 AUDIO_WORDS = ("mp3", "صوت", "شنیدن", "audio", "mpeg", "m4a")
 VIDEO_WORDS = ("mp4", "تصوير", "تصویر", "ویدئو", "ويدئو", "فیلم", "video", "flv")
 
-CSV_FIELDS = ["file_name", "program_name", "episode_name", "channel", "link",
+CSV_FIELDS = ["file_name", "program_name", "episode_name", "channel",
+              "link", "episode_link",
               "date_of_program", "duration", "download_date"]   # duration in minutes
 MIN_BYTES = 8192
 SUFFIX_KIND = {}
@@ -820,6 +821,14 @@ def grab(session, groups, folder, want, delay, store, fallback=True):
 # csv store (one per folder)
 # --------------------------------------------------------------------------
 
+def episode_key(url):
+    """Identify an episode page by its ch/e ids, so a changed VALID= or a
+    reordered query string still matches a previous run."""
+    q = parse_qs(urlparse(url or "").query)
+    e, ch = q.get("e", [""])[0], q.get("ch", [""])[0]
+    return f"{ch}:{e}" if e else (url or "")
+
+
 def now_stamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1074,11 +1083,16 @@ def main():
         # A channel can only broadcast one thing at a given date+time, so the
         # date shown on the listing identifies an episode uniquely. That lets us
         # recognise what we already have WITHOUT opening each episode page.
-        have_by_date = {}
+        # An episode page URL identifies an episode exactly, so prefer it.
+        # Rows written before episode_link existed fall back to matching on the
+        # broadcast date, scoped to this programme so that sibling programmes
+        # sharing the channel folder cannot mask each other.
+        have_by_episode, have_by_date = {}, {}
         for row in store["known"].values():
-            # several programmes share one channel folder, so only rows from THIS
-            # programme may mask an episode — otherwise a matching date in a
-            # sibling programme would make us skip an episode we never fetched.
+            el = (row.get("episode_link") or "").strip()
+            if el:
+                have_by_episode.setdefault(episode_key(el), []).append(row)
+                continue
             if program and (row.get("program_name") or "") not in ("", program):
                 continue
             d = (row.get("date_of_program") or "").strip()
@@ -1088,9 +1102,11 @@ def main():
         print(f"\n{len(episodes)} episode(s) -> {folder}\n")
         for i, ep in enumerate(episodes, 1):
             # both date formats, in case an earlier run used --gregorian
-            keys = ([format_date(ep["parts"], g) for g in (False, True)]
-                    if ep["parts"] else [])
-            done = next((have_by_date[k] for k in keys if k in have_by_date), None)
+            done = have_by_episode.get(episode_key(ep["url"]))
+            if done is None:                      # older CSV: match on date
+                keys = ([format_date(ep["parts"], g) for g in (False, True)]
+                        if ep["parts"] else [])
+                done = next((have_by_date[k] for k in keys if k in have_by_date), None)
             if done and not args.recheck and all(
                     os.path.exists(os.path.join(folder, r.get("file_name", "")))
                     for r in done):
@@ -1148,6 +1164,7 @@ def main():
                     "episode_name": ep["title"] or ott_name(html),
                     "channel": channel_label,
                     "link": link,
+                    "episode_link": ep["url"],
                     "date_of_program": format_date(ep["parts"] or parts_from_filename(fname),
                                                    args.gregorian),
                     "duration": duration_minutes(os.path.join(folder, fname)),
