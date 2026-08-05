@@ -751,70 +751,109 @@ def option_kind(vid, group):
     return SUFFIX_KIND.get(vid.rsplit("_", 1)[-1], "unknown")
 
 
-def try_options(session, options, folder, want, delay, store):
+def try_option(session, vid, group, folder, want, delay, store, seen_names):
     """
-    Walk download options in order, trying every server for each, until one
-    file lands complete. Returns (file_name, url) or None.
+    Try each server for ONE download option.
+      (file_name, url) -> got it
+      "skip"           -> not wanted here (duplicate, or the wrong format)
+      None             -> genuinely failed
     """
-    for vid, g in options:
-        for url in g["urls"]:                    # each server for this option
-            prev = store["known"].get(url)
-            if prev and os.path.exists(os.path.join(folder, prev.get("file_name", ""))):
-                print(f"  = have {prev['file_name']}")
-                store["used"].add(prev["file_name"])
-                return prev["file_name"], url
+    for url in group["urls"]:
+        prev = store["known"].get(url)
+        if prev and os.path.exists(os.path.join(folder, prev.get("file_name", ""))):
+            print(f"  = have {prev['file_name']}")
+            store["used"].add(prev["file_name"])
+            seen_names.add(prev["file_name"])
+            return prev["file_name"], url
 
-            r = open_stream(session, url)
-            if r is None:
-                print("  · that server did not deliver, trying the next one")
-                continue
-            fname = safe_name(cd_filename(r.headers.get("Content-Disposition")))
-            actual = kind_of(r.headers.get("Content-Type"), fname)
-            if actual != "unknown":
-                SUFFIX_KIND[vid.rsplit("_", 1)[-1]] = actual
-            if actual not in ("unknown", want):
-                r.close()
-                print(f"  · this one is {actual}, not {want}")
-                break                            # its mirrors are the same thing
-            if not fname:
-                fname = f"{safe_name(vid)}.{'mp4' if want == 'video' else 'mp3'}"
-            stem, ext = os.path.splitext(fname)
-            n = 2
-            while fname in store["used"]:
-                fname = f"{stem}-{n}{ext}"
-                n += 1
-            dest = os.path.join(folder, fname)
-            if os.path.exists(dest) and os.path.getsize(dest) > MIN_BYTES:
-                r.close()
-                print(f"  = have {fname}")
-                store["used"].add(fname)
-                return fname, url
-            if download(session, url, dest, delay, first_response=r):
-                store["used"].add(fname)
-                return fname, url
-            print("  · that download did not complete, trying the next server")
+        r = open_stream(session, url)
+        if r is None:
+            print("  · that server did not deliver, trying the next one")
+            continue
+        fname = safe_name(cd_filename(r.headers.get("Content-Disposition")))
+        actual = kind_of(r.headers.get("Content-Type"), fname)
+        if actual != "unknown":
+            SUFFIX_KIND[vid.rsplit("_", 1)[-1]] = actual
+        if actual not in ("unknown", want):
+            r.close()
+            print(f"  · this one is {actual}, not {want}")
+            return "skip"                   # its mirrors serve the same thing
+        if fname and fname in seen_names:
+            r.close()
+            print(f"  · same file as one already taken ({fname})")
+            return "skip"
+        if not fname:
+            fname = f"{safe_name(vid)}.{'mp4' if want == 'video' else 'mp3'}"
+        stem, ext = os.path.splitext(fname)
+        n = 2
+        while fname in store["used"]:
+            fname = f"{stem}-{n}{ext}"
+            n += 1
+        dest = os.path.join(folder, fname)
+        if os.path.exists(dest) and os.path.getsize(dest) > MIN_BYTES:
+            r.close()
+            print(f"  = have {fname}")
+            store["used"].add(fname)
+            seen_names.add(fname)
+            return fname, url
+        if download(session, url, dest, delay, first_response=r):
+            store["used"].add(fname)
+            seen_names.add(fname)
+            return fname, url
+        print("  · that download did not complete, trying the next server")
     return None
 
 
 def grab(session, groups, folder, want, delay, store, fallback=True):
     """
-    Fetch one file for this episode: the preferred format if it is offered,
-    otherwise the other one. Every server listed for a format is tried before
-    moving on. Returns [(file_name, url)] or [].
+    Download every file of the preferred format on this episode page.
+
+    An episode page can carry several separate recordings, and each recording is
+    usually offered as mp3 and mp4 across several servers. Links are classified
+    by their own label — "(.mp3)" / "(.mp4)" — and mirrors collapse because they
+    share a vid. So the number of DISTINCT mp3 options is the number of files to
+    fetch. Only if there is no mp3 at all does it fall back to mp4.
+
+    (The vid number is deliberately not used to group: the mp3 and mp4 of one
+    recording can have completely different vid numbers.)
+
+    Returns [(file_name, url), ...].
     """
     other = "video" if want == "audio" else "audio"
-    for i, kind in enumerate([want] + ([other] if fallback else [])):
-        # exact matches first, then anything unlabelled, in page order
-        picks = [(v, g) for v, g in groups.items() if option_kind(v, g) == kind]
-        picks += [(v, g) for v, g in groups.items() if option_kind(v, g) == "unknown"]
-        if not picks:
+    seen_names, results = set(), []
+
+    for pass_no, kind in enumerate([want] + ([other] if fallback else [])):
+        labelled = [(v, g) for v, g in groups.items() if option_kind(v, g) == kind]
+        unlabelled = [(v, g) for v, g in groups.items() if option_kind(v, g) == "unknown"]
+        if not labelled and not unlabelled:
             continue
-        if i:
+        if pass_no and labelled:
             print(f"  · no {want} on this page — trying {kind}")
-        got = try_options(session, picks, folder, kind, delay, store)
-        if got:
-            return [got]
-    return []
+
+        total, fails = len(labelled), 0
+        if total > 1:
+            print(f"  {total} separate {kind} file(s) on this page")
+        for i, (vid, g) in enumerate(labelled, 1):
+            if total > 1:
+                print(f"  -- item {i}/{total}")
+            got = try_option(session, vid, g, folder, kind, delay, store, seen_names)
+            if isinstance(got, tuple):
+                results.append(got)
+            elif got != "skip":
+                fails += 1
+
+        if not results:              # nothing labelled worked — probe the rest
+            for vid, g in unlabelled:
+                got = try_option(session, vid, g, folder, kind, delay, store, seen_names)
+                if isinstance(got, tuple):
+                    results.append(got)
+
+        if results:
+            if fails:
+                print(f"  ! {fails} of {total} item(s) on this page could not be "
+                      f"fetched — rerun with --recheck to retry", file=sys.stderr)
+            return results
+    return results
 
 
 # --------------------------------------------------------------------------
