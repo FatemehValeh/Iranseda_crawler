@@ -760,7 +760,8 @@ def try_option(session, vid, group, folder, want, delay, store, seen_names):
     """
     for url in group["urls"]:
         prev = store["known"].get(url)
-        if prev and os.path.exists(os.path.join(folder, prev.get("file_name", ""))):
+        if prev and (store.get("trust_csv")
+                     or os.path.exists(os.path.join(folder, prev.get("file_name", "")))):
             print(f"  = have {prev['file_name']}")
             store["used"].add(prev["file_name"])
             seen_names.add(prev["file_name"])
@@ -872,34 +873,54 @@ def now_stamp():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def open_store(folder):
+def open_store(folder, trust_csv=True):
+    """
+    Load the CSV. Every row is kept, whether or not its audio file is still in
+    the folder — files are often moved to external storage once archived, and
+    dropping those rows would both erase the index and re-download everything.
+
+    trust_csv=True  : a row means "already downloaded", file present or not
+    trust_csv=False : a row whose file is gone is fetched again
+    """
     path = os.path.join(folder, "episodes.csv")
-    known = {}
+    known, missing = {}, 0
     if os.path.exists(path):
         with open(path, encoding="utf-8-sig", newline="") as fh:
             for row in csv.DictReader(fh):
-                # keep old rows only if their file is still on disk
-                if row.get("file_name") and os.path.exists(os.path.join(folder, row["file_name"])):
-                    fp = os.path.join(folder, row["file_name"])
+                fname = (row.get("file_name") or "").strip()
+                if not fname:
+                    continue
+                fp = os.path.join(folder, fname)
+                if os.path.exists(fp):
                     if not row.get("duration"):          # older CSV, or new column
                         row["duration"] = duration_minutes(fp)
-                    if not row.get("download_date"):     # use when the file was written
+                    if not row.get("download_date"):     # when the file was written
                         try:
                             row["download_date"] = datetime.datetime.fromtimestamp(
                                 os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M:%S")
                         except OSError:
                             pass
-                    known[row.get("link", "")] = row
+                else:
+                    missing += 1
+                known[row.get("link", "")] = row
     return {"folder": folder, "csv": path, "known": known, "rows": [],
-            "used": {r["file_name"] for r in known.values()}}
+            "used": {(r.get("file_name") or "") for r in known.values()} - {""},
+            "trust_csv": trust_csv, "missing": missing}
 
 
-def flush_store(store):
+def flush_store(store, sort_by_date=False):
+    """
+    Rewrite the CSV. Existing rows keep the position they already had and newly
+    downloaded ones are appended at the end, so the file reads in the order
+    things were actually fetched. Dicts preserve insertion order, and assigning
+    to an existing key updates it in place rather than moving it.
+    """
     merged = {r["link"]: r for r in store["known"].values()}
     for r in store["rows"]:
         merged[r["link"]] = r
-    rows = sorted(merged.values(), key=lambda r: (r.get("date_of_program", ""),
-                                                  r.get("file_name", "")))
+    rows = list(merged.values())
+    if sort_by_date:
+        rows.sort(key=lambda r: (r.get("date_of_program", ""), r.get("file_name", "")))
     with open(store["csv"], "w", encoding="utf-8-sig", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         w.writeheader()
@@ -1041,6 +1062,11 @@ def main():
     ap.add_argument("--no-fallback", action="store_true",
                     help="do not fall back to the other format when the "
                          "preferred one is missing")
+    ap.add_argument("--sort-by-date", action="store_true",
+                    help="order the CSV by broadcast date instead of download order")
+    ap.add_argument("--redownload-missing", action="store_true",
+                    help="re-fetch files listed in the CSV that are no longer "
+                         "in the folder (default: treat them as done)")
     ap.add_argument("--recheck", action="store_true",
                     help="open every episode page even if the CSV says it is done")
     ap.add_argument("--gregorian", action="store_true")
@@ -1115,7 +1141,16 @@ def main():
                   os.path.join(args.outdir, args.folder or slug or "downloads"))
         os.makedirs(folder, exist_ok=True)
         if folder not in stores:
-            stores[folder] = open_store(folder)
+            stores[folder] = open_store(folder, trust_csv=not args.redownload_missing)
+            gone = stores[folder]["missing"]
+            if gone:
+                if args.redownload_missing:
+                    print(f"  {gone} file(s) in the CSV are not in this folder — "
+                          f"they will be downloaded again")
+                else:
+                    print(f"  {gone} file(s) in the CSV are not in this folder "
+                          f"(moved to other storage?) — counted as already done. "
+                          f"Use --redownload-missing to fetch them again.")
         store = stores[folder]
         channel_label = args.channel or fa or slug
 
@@ -1146,9 +1181,10 @@ def main():
                 keys = ([format_date(ep["parts"], g) for g in (False, True)]
                         if ep["parts"] else [])
                 done = next((have_by_date[k] for k in keys if k in have_by_date), None)
-            if done and not args.recheck and all(
-                    os.path.exists(os.path.join(folder, r.get("file_name", "")))
-                    for r in done):
+            if done and not args.recheck and (
+                    store["trust_csv"] or all(
+                        os.path.exists(os.path.join(folder, r.get("file_name", "")))
+                        for r in done)):
                 skipped += 1
                 if skipped == 1 or skipped % 25 == 0:
                     print(f"[{i}/{len(episodes)}] skipping {skipped} already-downloaded "
@@ -1196,6 +1232,9 @@ def main():
                 continue
             misses, stalls = 0, 0
             for fname, link in files:
+                # A row already in `known` means the file was on disk before this
+                # run, so grab() did not fetch it — keep its original timestamp.
+                was_there = store["known"].get(link) or {}
                 store["rows"].append({
                     "file_name": fname,
                     "program_name": (program or page_title(html)
@@ -1207,15 +1246,15 @@ def main():
                     "date_of_program": format_date(ep["parts"] or parts_from_filename(fname),
                                                    args.gregorian),
                     "duration": duration_minutes(os.path.join(folder, fname)),
-                    "download_date": now_stamp(),
+                    "download_date": was_there.get("download_date") or now_stamp(),
                 })
                 saved += 1
-            flush_store(store)              # keep the CSV correct if interrupted
+            flush_store(store, args.sort_by_date)   # correct even if interrupted
 
     print("\n" + "=" * 50)
     grand = 0.0
     for folder, store in stores.items():
-        n = flush_store(store)
+        n = flush_store(store, args.sort_by_date)
         mins = 0.0
         for r in list(store["known"].values()) + store["rows"]:
             try:
